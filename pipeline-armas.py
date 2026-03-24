@@ -109,6 +109,7 @@ SEL = {
     "fase3_boton_refresh": '#tabGestion\\:creaCitaPolJurForm\\:botonCaptcha',
     "fase3_terminos_box": '#tabGestion\\:creaCitaPolJurForm\\:terminos .ui-chkbox-box',
     "fase3_terminos_input": '#tabGestion\\:creaCitaPolJurForm\\:terminos_input',
+    "fase3_boton_generar_cita": '#tabGestion\\:creaCitaPolJurForm\\:j_idt561',
 }
 
 
@@ -537,6 +538,166 @@ def completar_fase_3_resumen(page):
         raise Exception("No se pudo marcar 'Acepto los términos y condiciones de Sucamec'")
 
     print("   ✓ Términos y condiciones marcados")
+
+
+def generar_cita_final_con_reintento_rapido(page, max_intentos: int = 3):
+    """
+    Paso final opcional (desactivado por ahora en el flujo principal).
+    Hace click en 'Generar Cita' y, si detecta error de captcha/validación,
+    reintenta rápido regenerando el captcha de Fase 3.
+    """
+    print("\n🧪 Paso final opcional: Generar Cita (reintento rápido)")
+
+    boton_generar = page.locator(SEL["fase3_boton_generar_cita"])
+    boton_generar.wait_for(state="visible", timeout=10000)
+
+    for intento in range(1, max_intentos + 1):
+        inicio_validacion = time.time()
+        print(f"   ↻ Intento generar cita {intento}/{max_intentos}")
+        boton_generar.click(timeout=10000)
+
+        url_ok = False
+        try:
+            # Validación rápida: si avanza de vista, debe ocurrir casi inmediato.
+            page.wait_for_url("**/aplicacion/**", timeout=1000)
+            if "GestionCitas.xhtml" not in page.url:
+                url_ok = True
+        except PlaywrightTimeoutError:
+            url_ok = False
+
+        if url_ok:
+            tiempo = time.time() - inicio_validacion
+            print(f"   ✓ Generar Cita confirmado en {tiempo:.2f}s")
+            print(f"   → URL: {page.url}")
+            return True
+
+        mensaje_error = ""
+        for selector in [
+            ".ui-messages-error",
+            ".ui-message-error",
+            ".ui-growl-message-error",
+            "[class*='error']",
+            ".mensajeError",
+        ]:
+            try:
+                loc = page.locator(selector)
+                total = min(loc.count(), 3)
+                for i in range(total):
+                    txt = (loc.nth(i).inner_text() or "").strip()
+                    if txt:
+                        mensaje_error = txt
+                        break
+                if mensaje_error:
+                    break
+            except Exception:
+                pass
+
+        tiempo = time.time() - inicio_validacion
+        if mensaje_error:
+            print(f"   ⚠️ Mensaje detectado: {mensaje_error}")
+        print(f"   ⏱️ Validación final: {tiempo:.2f}s")
+
+        error_captcha = bool(re.search(r"captcha|c[oó]digo|validaci[oó]n", mensaje_error, flags=re.IGNORECASE))
+        if not error_captcha:
+            raise Exception("No se pudo confirmar la generación de cita (sin error de captcha detectable)")
+
+        # Reintento rápido: resolver captcha de Fase 3 y remarcado de términos si aplica.
+        nuevo_captcha = solve_captcha_ocr_base(
+            page,
+            captcha_img_selector=SEL["fase3_captcha_img"],
+            boton_refresh_selector=SEL["fase3_boton_refresh"],
+            contexto="CAPTCHA Fase 3 (reintento final)",
+            evitar_ambiguos=False,
+            min_fuzzy_hits=0,
+            max_intentos=3,
+        )
+
+        if nuevo_captcha and len(nuevo_captcha) == 5:
+            escribir_input_rapido(page, SEL["fase3_captcha_input"], nuevo_captcha)
+            print(f"   ✓ CAPTCHA reintento escrito: {nuevo_captcha}")
+        else:
+            print("   ⚠️ OCR no resolvió captcha en reintento final; pasar a ingreso manual")
+            solve_captcha_manual(page)
+
+        try:
+            if not page.locator(SEL["fase3_terminos_input"]).is_checked():
+                page.locator(SEL["fase3_terminos_box"]).click()
+                page.wait_for_timeout(150)
+        except Exception:
+            pass
+
+    raise Exception("No se pudo generar cita tras reintentos rápidos")
+
+
+def validar_resultado_login_por_ui(page, timeout_ms: int = 3000):
+    """
+    Determina resultado de login por señales de UI (no por URL):
+    - Éxito: aparece menú principal/controles de sesión autenticada.
+    - Falla: aparece mensaje de error de validación/captcha.
+    Devuelve: (login_ok: bool, mensaje_error: str|None, tiempo_segundos: float)
+    """
+    inicio = time.time()
+
+    selectores_exito = [
+        "#j_idt11\\:menuPrincipal",
+        "#j_idt11\\:j_idt18",  # botón "Cerrar Sesión"
+        "form#gestionCitasForm",
+    ]
+    selectores_error = [
+        ".ui-messages-error",
+        ".ui-message-error",
+        ".ui-growl-message-error",
+        ".mensajeError",
+        "[class*='error']",
+        "[class*='Error']",
+    ]
+
+    while (time.time() - inicio) * 1000 < timeout_ms:
+        for sel in selectores_exito:
+            try:
+                loc = page.locator(sel)
+                if loc.count() > 0 and loc.first.is_visible():
+                    return True, None, (time.time() - inicio)
+            except Exception:
+                pass
+
+        for sel in selectores_error:
+            try:
+                loc = page.locator(sel)
+                total = min(loc.count(), 3)
+                for i in range(total):
+                    txt = (loc.nth(i).inner_text() or "").strip()
+                    if txt:
+                        return False, txt, (time.time() - inicio)
+            except Exception:
+                pass
+
+        page.wait_for_timeout(120)
+
+    # Última comprobación rápida al vencer el timeout.
+    for sel in selectores_exito:
+        try:
+            if page.locator(sel).count() > 0:
+                return True, None, (time.time() - inicio)
+        except Exception:
+            pass
+
+    mensaje_error = None
+    for sel in selectores_error:
+        try:
+            loc = page.locator(sel)
+            total = min(loc.count(), 3)
+            for i in range(total):
+                txt = (loc.nth(i).inner_text() or "").strip()
+                if txt:
+                    mensaje_error = txt
+                    break
+            if mensaje_error:
+                break
+        except Exception:
+            pass
+
+    return False, mensaje_error, (time.time() - inicio)
 
 
 def normalizar_fecha_excel(valor_fecha: str) -> str:
@@ -1538,30 +1699,7 @@ def llenar_login_sel():
                 page.locator(SEL["ingresar"]).click(timeout=10000)
 
                 print("⏳ Validando acceso...")
-                tiempo_validacion_inicio = time.time()
-                url_ok = False
-                mensaje_error = None
-                
-                try:
-                    # Esperamos máximo 1 segundo para el cambio de URL (debe ser rápido si es exitoso)
-                    page.wait_for_url("**/aplicacion/**", timeout=1000)
-                    url_ok = True
-                except PlaywrightTimeoutError:
-                    # Si falló, verificamos si hay un mensaje de error visible
-                    try:
-                        # Buscamos mensajes de error comunes en la página
-                        error_elements = page.locator("[class*='error'], [class*='Error'], .ui-messages-error, .mensajeError").all()
-                        if error_elements:
-                            for elem in error_elements:
-                                try:
-                                    msg = elem.inner_text().strip()
-                                    if msg:
-                                        mensaje_error = msg
-                                        break
-                                except:
-                                    pass
-                    except:
-                        pass
+                url_ok, mensaje_error, tiempo_espera = validar_resultado_login_por_ui(page, timeout_ms=3000)
 
                 if url_ok:
                     total_time = time.time() - start_time
@@ -1591,13 +1729,17 @@ def llenar_login_sel():
                     # ── FASE 3: CAPTCHA RESUMEN + CHECK TÉRMINOS ─────────────
                     completar_fase_3_resumen(page)
 
+                    # ── PASO FINAL (DESACTIVADO POR AHORA) ───────────────────
+                    # Implementado con reintento rápido si el captcha de validación falla.
+                    # Descomentar solo cuando se autorice ejecutar el cierre transaccional.
+                    # generar_cita_final_con_reintento_rapido(page, max_intentos=3)
+
                     duracion_total_flujo = time.time() - inicio_total_flujo
                     print(f"\n⏱️ Tiempo total del flujo (inicio → fin Fase 3): {duracion_total_flujo:.2f} segundos")
 
                     break
                 else:
-                    tiempo_espera = time.time() - tiempo_validacion_inicio
-                    print(f"❌ Login falló - URL NO cambió a /aplicacion/")
+                    print(f"❌ Login falló - no se detectó sesión autenticada")
                     print(f"   → URL actual: {page.url}")
                     if mensaje_error:
                         print(f"   → Error detectado: {mensaje_error}")
