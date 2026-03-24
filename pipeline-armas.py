@@ -545,6 +545,18 @@ def completar_fase_3_resumen(page):
     print("   ✓ Términos y condiciones marcados")
 
 
+def limpiar_para_siguiente_registro(page, motivo: str = ""):
+    """Pulsa botón Limpiar para reiniciar el wizard y seguir con el siguiente registro."""
+    boton_limpiar = page.locator(SEL["boton_limpiar"])
+    boton_limpiar.wait_for(state="visible", timeout=8000)
+    boton_limpiar.first.click(timeout=8000)
+    page.wait_for_timeout(180)
+    if motivo:
+        print(f"   ✓ Click en 'Limpiar' ({motivo})")
+    else:
+        print("   ✓ Click en 'Limpiar'")
+
+
 def generar_cita_final_con_reintento_rapido(page, max_intentos: int = 3):
     """
     Paso final opcional (desactivado por ahora en el flujo principal).
@@ -705,6 +717,67 @@ def validar_resultado_login_por_ui(page, timeout_ms: int = 3000):
     return False, mensaje_error, (time.time() - inicio)
 
 
+def pagina_muestra_servicio_no_disponible(page) -> bool:
+    """Detecta HTML de caída del servicio (HTTP 503 / Service Unavailable)."""
+    # Señales de estado saludable: si aparecen, no hay caída.
+    selectores_ok = [
+        SEL["tab_tradicional"],
+        SEL["numero_documento"],
+        "#j_idt11\\:menuPrincipal",
+        "form#gestionCitasForm",
+        SEL["reserva_form"],
+    ]
+    for sel in selectores_ok:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0 and loc.first.is_visible():
+                return False
+        except Exception:
+            pass
+
+    # Título de pestaña en estados 503.
+    try:
+        titulo = (page.title() or "").strip().upper()
+        if "SERVICE UNAVAILABLE" in titulo:
+            return True
+    except Exception:
+        pass
+
+    # h1 explícito del error de Apache/Proxy.
+    try:
+        h1 = (page.locator("h1").first.inner_text() or "").strip().upper()
+        if "SERVICE UNAVAILABLE" in h1:
+            return True
+    except Exception:
+        pass
+
+    # Fallback textual ligero (evita leer todo el HTML para no ralentizar iteraciones).
+    try:
+        body_text = (page.locator("body").inner_text() or "").upper()
+        if "SERVICE UNAVAILABLE" in body_text and "AUTENTICACION TRADICIONAL" not in body_text:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def esperar_hasta_servicio_disponible(page, url_objetivo: str, espera_segundos: int = 8):
+    """
+    Si SUCAMEC responde con Service Unavailable, espera y reintenta hasta recuperar servicio.
+    Se mantiene en bucle indefinido por requerimiento operativo.
+    """
+    intento = 0
+    while pagina_muestra_servicio_no_disponible(page):
+        intento += 1
+        print(f"⚠️ SUCAMEC no disponible (Service Unavailable). Reintento {intento} en {espera_segundos}s...")
+        time.sleep(espera_segundos)
+        try:
+            page.goto(url_objetivo, wait_until="domcontentloaded", timeout=45000)
+        except Exception as e:
+            print(f"   ↳ Error al reintentar acceso: {e}")
+
+
 def normalizar_fecha_excel(valor_fecha: str) -> str:
     """Convierte fechas de Excel al formato dd/mm/yyyy esperado por SEL."""
     texto = str(valor_fecha or "").strip()
@@ -837,7 +910,24 @@ def fecha_comparable(valor_fecha: str) -> str:
     return normalizar_fecha_excel(valor_fecha)
 
 
-def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str) -> dict:
+def obtener_indices_pendientes_excel(ruta_excel: str) -> list:
+    """Devuelve los índices de filas con estado Pendiente."""
+    if pd is None:
+        raise Exception("Falta dependencia 'pandas'. Instala con: pip install pandas openpyxl")
+    if not os.path.exists(ruta_excel):
+        raise Exception(f"No se encontró el Excel en: {ruta_excel}")
+
+    df = pd.read_excel(ruta_excel, dtype=str)
+    df.columns = [str(c).strip() for c in df.columns]
+    if "estado" not in df.columns:
+        raise Exception("El Excel no contiene la columna 'estado'")
+
+    df["estado"] = df["estado"].fillna("").astype(str).apply(limpiar_valor_excel)
+    pendientes = df[df["estado"].str.upper().str.contains("PENDIENTE", na=False)]
+    return list(pendientes.index)
+
+
+def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str, indice_excel_objetivo: int = None) -> dict:
     """
     Lee el Excel y devuelve el primer registro con estado 'Pendiente'.
     Campos mínimos requeridos para este paso: sede y fecha.
@@ -863,7 +953,10 @@ def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str) -> dict:
     if pendientes.empty:
         raise Exception("No hay registros con estado 'Pendiente' en el Excel")
 
-    indice_primer_pendiente = pendientes.index[0]
+    indice_primer_pendiente = pendientes.index[0] if indice_excel_objetivo is None else indice_excel_objetivo
+    if indice_primer_pendiente not in pendientes.index:
+        raise Exception(f"El índice objetivo {indice_primer_pendiente} no está en estado Pendiente")
+
     registro = pendientes.loc[indice_primer_pendiente].to_dict()
     registro["_excel_index"] = int(indice_primer_pendiente)
     registro["_excel_path"] = ruta_excel
@@ -1747,13 +1840,12 @@ def llenar_login_sel():
     inicio_total_flujo = time.time()
     duracion_total_flujo = None
 
-    registro_excel = cargar_primer_registro_pendiente_desde_excel(EXCEL_PATH)
-
     playwright = sync_playwright().start()
     browser = None
     login_exitoso = False
-    no_cupo_detectado = False
-    mensaje_sin_cupo = ""
+    total_ok = 0
+    total_sin_cupo = 0
+    total_error = 0
 
     try:
         for intento_global in range(3):
@@ -1782,6 +1874,7 @@ def llenar_login_sel():
 
             try:
                 page.goto(URL_LOGIN, wait_until="domcontentloaded", timeout=45000)
+                esperar_hasta_servicio_disponible(page, URL_LOGIN, espera_segundos=8)
                 print("1. Página de login cargada")
 
                 tab = page.locator(SEL["tab_tradicional"])
@@ -1827,28 +1920,78 @@ def llenar_login_sel():
                     # ── SELECCIONAR TIPO DE CITA: EXAMEN PARA POLÍGONO ───────
                     seleccionar_tipo_cita_poligono(page)
 
-                    # ── COMPLETAR RESERVA DE CUPOS: SEDE Y FECHA (Excel) ─────
-                    seleccionar_sede_y_fecha_desde_registro(page, registro_excel)
+                    indices_pendientes = obtener_indices_pendientes_excel(EXCEL_PATH)
+                    if not indices_pendientes:
+                        raise Exception("No hay registros Pendiente para procesar")
 
-                    # ── SELECCIONAR HORA (si hay cupos) Y AVANZAR ─────────────
-                    seleccionar_hora_con_cupo_y_avanzar(page, registro_excel)
+                    print(f"\n📚 Registros pendientes a procesar: {len(indices_pendientes)}")
 
-                    # ── COMPLETAR PASO 2 (TIPO OP, DNI, SI, NRO SOLICITUD) ───
-                    completar_paso_2_desde_registro(page, registro_excel)
+                    for n, idx_excel in enumerate(indices_pendientes, start=1):
+                        print(f"\n━━━━━━━━ Registro {n}/{len(indices_pendientes)} (idx={idx_excel}) ━━━━━━━━")
 
-                    # ── FASE 2 FINAL: TABLA TIPO ARMA + SIGUIENTE ────────────
-                    completar_tabla_tipos_arma_y_avanzar(page, registro_excel)
+                        # Si el portal cae en medio de la operación, esperamos recuperación antes de continuar.
+                        esperar_hasta_servicio_disponible(page, page.url, espera_segundos=8)
 
-                    # ── FASE 3: CAPTCHA RESUMEN + CHECK TÉRMINOS ─────────────
-                    completar_fase_3_resumen(page)
+                        registro_excel = cargar_primer_registro_pendiente_desde_excel(
+                            EXCEL_PATH,
+                            indice_excel_objetivo=idx_excel,
+                        )
 
-                    # ── PASO FINAL (DESACTIVADO POR AHORA) ───────────────────
-                    # Implementado con reintento rápido si el captcha de validación falla.
-                    # Descomentar solo cuando se autorice ejecutar el cierre transaccional.
-                    # generar_cita_final_con_reintento_rapido(page, max_intentos=3)
+                        try:
+                            # Tras Limpiar, en algunos casos se mantiene el mismo paso; en otros, conviene
+                            # reafirmar tipo de cita para garantizar contexto estable antes de sede/fecha.
+                            try:
+                                page.locator(SEL["reserva_form"]).wait_for(state="visible", timeout=2500)
+                            except Exception:
+                                seleccionar_tipo_cita_poligono(page)
+
+                            # ── COMPLETAR RESERVA DE CUPOS: SEDE Y FECHA (Excel) ─────
+                            seleccionar_sede_y_fecha_desde_registro(page, registro_excel)
+
+                            # ── SELECCIONAR HORA (si hay cupos) Y AVANZAR ─────────────
+                            seleccionar_hora_con_cupo_y_avanzar(page, registro_excel)
+
+                            # ── COMPLETAR PASO 2 (TIPO OP, DNI, SI, NRO SOLICITUD) ───
+                            completar_paso_2_desde_registro(page, registro_excel)
+
+                            # ── FASE 2 FINAL: TABLA TIPO ARMA + SIGUIENTE ────────────
+                            completar_tabla_tipos_arma_y_avanzar(page, registro_excel)
+
+                            # ── FASE 3: CAPTCHA RESUMEN + CHECK TÉRMINOS ─────────────
+                            completar_fase_3_resumen(page)
+
+                            # ── PASO FINAL (DESACTIVADO) ─────────────────────────────
+                            # El agendado/generación final sigue comentado por control operativo.
+                            # generar_cita_final_con_reintento_rapido(page, max_intentos=3)
+
+                            # Requisito: tras flujo normal, limpiar y pasar al siguiente registro.
+                            limpiar_para_siguiente_registro(page, motivo="fin de flujo")
+                            total_ok += 1
+
+                        except SinCupoError as e:
+                            total_sin_cupo += 1
+                            print(f"⛔ Sin cupo en este registro: {e}")
+                            registrar_sin_cupo_en_excel(
+                                EXCEL_PATH,
+                                registro_excel,
+                                f"No alcanzo cupo para horario {registro_excel.get('hora_rango', '')}"
+                            )
+                            # En caso de cupo 0 ya se accionó Limpiar dentro de seleccionar_hora_con_cupo_y_avanzar.
+                            continue
+
+                        except Exception as e:
+                            total_error += 1
+                            print(f"❌ Error en registro idx={idx_excel}: {e}")
+                            # Intento de recuperación para seguir con el siguiente registro.
+                            try:
+                                limpiar_para_siguiente_registro(page, motivo="recuperación por error")
+                            except Exception:
+                                pass
+                            continue
 
                     duracion_total_flujo = time.time() - inicio_total_flujo
-                    print(f"\n⏱️ Tiempo total del flujo (inicio → fin Fase 3): {duracion_total_flujo:.2f} segundos")
+                    print(f"\n⏱️ Tiempo total del flujo: {duracion_total_flujo:.2f} segundos")
+                    print(f"📊 Resumen: OK={total_ok} | SIN_CUPO={total_sin_cupo} | ERROR={total_error}")
 
                     break
                 else:
@@ -1858,17 +2001,6 @@ def llenar_login_sel():
                         print(f"   → Error detectado: {mensaje_error}")
                     print(f"   ⏱️ Tiempo validación: {tiempo_espera:.2f} segundos")
                     raise Exception("CAPTCHA incorrecto o credenciales inválidas")
-
-            except SinCupoError as e:
-                no_cupo_detectado = True
-                mensaje_sin_cupo = str(e)
-                print(f"⛔ Flujo detenido por falta de cupos: {mensaje_sin_cupo}")
-                registrar_sin_cupo_en_excel(
-                    EXCEL_PATH,
-                    registro_excel,
-                    f"No alcanzo cupo para horario {registro_excel.get('hora_rango', '')}"
-                )
-                break
 
             except Exception as e:
                 print(f"❌ Intento {intento_global+1} falló: {e}")
@@ -1888,35 +2020,21 @@ def llenar_login_sel():
                     time.sleep(60)
             except KeyboardInterrupt:
                 print("\n🛑 Interrupción manual. Cerrando navegador...")
-        elif no_cupo_detectado:
-            print("\n⛔ Flujo detenido: no hay cupos libres para la hora solicitada.")
-            if mensaje_sin_cupo:
-                print(f"   → Detalle: {mensaje_sin_cupo}")
-            print("   Navegador queda abierto para revisión manual.")
-            print("   Presiona Ctrl+C cuando quieras finalizar el script.")
-            try:
-                while True:
-                    time.sleep(60)
-            except KeyboardInterrupt:
-                print("\n🛑 Interrupción manual. Fin del script (sin cierre automático del navegador).")
         else:
             print("\n❌ No se pudo completar el login después de todos los intentos.")
             input("   Presiona ENTER para cerrar el navegador...")
 
     finally:
-        if no_cupo_detectado:
-            print("Navegador no cerrado automáticamente (caso sin cupo).")
-        else:
-            try:
-                if browser is not None:
-                    browser.close()
-            except Exception:
-                pass
-            try:
-                playwright.stop()
-            except Exception:
-                pass
-            print("Navegador cerrado.")
+        try:
+            if browser is not None:
+                browser.close()
+        except Exception:
+            pass
+        try:
+            playwright.stop()
+        except Exception:
+            pass
+        print("Navegador cerrado.")
 
 
 if __name__ == "__main__":
