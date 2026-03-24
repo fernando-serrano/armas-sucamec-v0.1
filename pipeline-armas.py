@@ -38,6 +38,13 @@ CREDENCIALES = {
     "contrasena": os.getenv("CLAVE_SEL", ""),
 }
 
+CREDENCIALES_SELVA = {
+    "tipo_documento_valor": os.getenv("SELVA_TIPO_DOC", "RUC"),
+    "numero_documento": os.getenv("SELVA_NUMERO_DOCUMENTO", ""),
+    "usuario": os.getenv("SELVA_USUARIO_SEL", ""),
+    "contrasena": os.getenv("SELVA_CLAVE_SEL", ""),
+}
+
 SEL = {
     "tab_tradicional": 'a[href="#tabViewLogin:j_idt33"]',
     "tipo_doc_select": "#tabViewLogin\\:tradicionalForm\\:tipoDoc_input",
@@ -911,11 +918,39 @@ def fecha_comparable(valor_fecha: str) -> str:
     return normalizar_fecha_excel(valor_fecha)
 
 
-def obtener_indices_pendientes_excel(ruta_excel: str) -> list:
+def normalizar_ruc_operativo(valor_ruc: str) -> str:
+    """Normaliza texto de RUC/razón social para clasificación operativa."""
+    return normalizar_texto_comparable(limpiar_valor_excel(valor_ruc))
+
+
+def obtener_grupo_ruc(valor_ruc: str) -> str:
+    """Clasifica el RUC/razón social en SELVA, JV u OTRO."""
+    base = normalizar_ruc_operativo(valor_ruc)
+    if "SELVA" in base or "20493762789" in base:
+        return "SELVA"
+    if "J&V" in base or "J V" in base or "RESGUARDO" in base or "20100901481" in base:
+        return "JV"
+    return "OTRO"
+
+
+def prioridad_orden(valor_prioridad: str) -> int:
+    """ALTA tiene precedencia sobre NORMAL; cualquier otro valor cae en NORMAL."""
+    base = normalizar_texto_comparable(limpiar_valor_excel(valor_prioridad))
+    return 0 if base == "ALTA" else 1
+
+
+def resolver_credenciales_por_grupo_ruc(grupo_ruc: str) -> dict:
+    if grupo_ruc == "SELVA":
+        return CREDENCIALES_SELVA
+    return CREDENCIALES
+
+
+def obtener_trabajos_pendientes_excel(ruta_excel: str) -> list:
     """
-    Devuelve índices de trabajo (únicos) en estado Pendiente.
-    Deduplica por doc_vigilante+dni, nro_solicitud y fecha_programacion/fecha,
-    para evitar reprocesar registros que pertenecen a una misma cita/iteración.
+    Devuelve trabajos pendientes únicos y ordenados por prioridad operativa:
+    1) SELVA primero
+    2) prioridad Alta antes de Normal
+    3) orden original del Excel como desempate
     """
     if pd is None:
         raise Exception("Falta dependencia 'pandas'. Instala con: pip install pandas openpyxl")
@@ -927,46 +962,89 @@ def obtener_indices_pendientes_excel(ruta_excel: str) -> list:
     if "estado" not in df.columns:
         raise Exception("El Excel no contiene la columna 'estado'")
 
-    df["estado"] = df["estado"].fillna("").astype(str).apply(limpiar_valor_excel)
+    for col in df.columns:
+        df[col] = df[col].fillna("").astype(str).apply(limpiar_valor_excel)
+
     if "doc_vigilante" not in df.columns:
         df["doc_vigilante"] = ""
     if "dni" not in df.columns:
         df["dni"] = ""
     if "nro_solicitud" not in df.columns:
         df["nro_solicitud"] = ""
+    if "ruc" not in df.columns:
+        df["ruc"] = ""
+    if "prioridad" not in df.columns:
+        df["prioridad"] = "Normal"
+
     fecha_col_programacion = "fecha_programacion" if "fecha_programacion" in df.columns else "fecha"
+    if fecha_col_programacion not in df.columns:
+        raise Exception("El Excel no contiene columna de fecha (fecha_programacion/fecha)")
 
-    # Limpieza mínima para claves de deduplicación.
-    for c in ["doc_vigilante", "dni", "nro_solicitud", fecha_col_programacion]:
-        if c in df.columns:
-            df[c] = df[c].fillna("").astype(str).apply(limpiar_valor_excel)
-
-    pendientes = df[df["estado"].str.upper().str.contains("PENDIENTE", na=False)]
+    pendientes = df[df["estado"].str.upper().str.contains("PENDIENTE", na=False)].copy()
     if pendientes.empty:
         return []
 
-    # Por defecto, procesar solo fecha de programación de hoy.
-    # Puede desactivarse explícitamente con VALIDAR_FECHA_PROGRAMACION_HOY=0.
     validar_hoy = os.getenv("VALIDAR_FECHA_PROGRAMACION_HOY", "1").strip().lower() in {"1", "true", "si", "sí", "yes"}
     if validar_hoy:
         hoy = date.today().strftime("%d/%m/%Y")
         pendientes = pendientes[
             pendientes[fecha_col_programacion].apply(fecha_comparable) == hoy
         ]
+        if pendientes.empty:
+            return []
 
-    indices_unicos = []
+    pendientes["_idx_excel"] = pendientes.index
+    pendientes["_doc_norm"] = pendientes.apply(
+        lambda r: str(r.get("doc_vigilante", "") or r.get("dni", "")).strip(),
+        axis=1,
+    )
+    pendientes["_nro_norm"] = pendientes["nro_solicitud"].apply(lambda v: str(v or "").strip())
+    pendientes["_fecha_prog"] = pendientes[fecha_col_programacion].apply(fecha_comparable)
+    pendientes["_ruc_raw"] = pendientes["ruc"].apply(lambda v: str(v or "").strip())
+    pendientes["_ruc_grupo"] = pendientes["_ruc_raw"].apply(obtener_grupo_ruc)
+    pendientes["_ruc_orden"] = pendientes["_ruc_grupo"].map({"SELVA": 0, "JV": 1, "OTRO": 2})
+    pendientes["_prioridad_raw"] = pendientes["prioridad"].apply(lambda v: str(v or "").strip())
+    pendientes["_prioridad_orden"] = pendientes["_prioridad_raw"].apply(prioridad_orden)
+
+    pendientes = pendientes.sort_values(
+        by=["_ruc_orden", "_prioridad_orden", "_idx_excel"],
+        ascending=[True, True, True],
+        kind="stable",
+    )
+
+    trabajos = []
     claves_vistas = set()
-    for idx, fila in pendientes.iterrows():
-        doc = str(fila.get("doc_vigilante", "") or fila.get("dni", "")).strip()
-        nro = str(fila.get("nro_solicitud", "")).strip()
-        fecha_prog = fecha_comparable(fila.get(fecha_col_programacion, fila.get("fecha", "")))
-        clave = (doc, nro, fecha_prog)
+    for _, fila in pendientes.iterrows():
+        clave = (
+            fila.get("_doc_norm", ""),
+            fila.get("_nro_norm", ""),
+            fila.get("_fecha_prog", ""),
+            fila.get("_ruc_grupo", "OTRO"),
+        )
         if clave in claves_vistas:
             continue
         claves_vistas.add(clave)
-        indices_unicos.append(idx)
+        trabajos.append(
+            {
+                "idx_excel": int(fila.get("_idx_excel")),
+                "ruc": fila.get("_ruc_raw", ""),
+                "ruc_grupo": fila.get("_ruc_grupo", "OTRO"),
+                "prioridad": fila.get("_prioridad_raw", "Normal"),
+                "fecha_programacion": fila.get("_fecha_prog", ""),
+            }
+        )
 
-    return indices_unicos
+    return trabajos
+
+
+def obtener_indices_pendientes_excel(ruta_excel: str) -> list:
+    """
+    Devuelve índices de trabajo (únicos) en estado Pendiente.
+    Deduplica por doc_vigilante+dni, nro_solicitud y fecha_programacion/fecha,
+    para evitar reprocesar registros que pertenecen a una misma cita/iteración.
+    """
+    trabajos = obtener_trabajos_pendientes_excel(ruta_excel)
+    return [t["idx_excel"] for t in trabajos]
 
 
 def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str, indice_excel_objetivo: int = None) -> dict:
@@ -1118,6 +1196,8 @@ def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str, indice_excel_o
     registro["hora_rango"] = hora_rango
     registro["doc_vigilante"] = doc_vigilante
     registro["fecha_programacion"] = fecha_programacion_valor
+    registro["ruc"] = registro.get("ruc", "")
+    registro["prioridad"] = registro.get("prioridad", "")
     registro["objetivos_arma"] = objetivos_arma
     registro["tipos_arma_objetivo"] = tipos_arma_objetivo
     registro["armas_objetivo"] = armas_excel
@@ -1131,6 +1211,8 @@ def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str, indice_excel_o
     print(f"   • doc_vigilante: {doc_vigilante}")
     print(f"   • nro_solicitud: {nro_solicitud}")
     print(f"   • fecha_programacion: {fecha_programacion_valor}")
+    print(f"   • ruc: {registro.get('ruc', '')}")
+    print(f"   • prioridad: {registro.get('prioridad', '')}")
     print(f"   • siguiente_mismo_doc_y_fecha: {siguiente_mismo_doc_y_fecha}")
     print(f"   • tipo_arma (excel): {tipos_arma_excel}")
     print(f"   • arma (excel): {armas_excel}")
@@ -1896,89 +1978,127 @@ def llenar_login_sel():
     total_sin_cupo = 0
     total_error = 0
 
-    try:
-        for intento_global in range(3):
-            start_time = time.time()
-            print(f"\n🔄 Intento global {intento_global+1}/3")
-
-            if browser is not None:
-                try:
-                    browser.close()
-                except Exception:
-                    pass
-
-            browser = playwright.chromium.launch(
-                headless=False,
-                slow_mo=0,
-                args=[
-                    "--start-maximized",
-                    "--disable-infobars",
-                    "--window-size=1920,1080",
-                    "--window-position=0,0"
-                ]
+    def validar_credenciales_configuradas(credenciales: dict, etiqueta: str):
+        faltantes = []
+        if not str(credenciales.get("numero_documento", "")).strip():
+            faltantes.append("numero_documento")
+        if not str(credenciales.get("usuario", "")).strip():
+            faltantes.append("usuario")
+        if not str(credenciales.get("contrasena", "")).strip():
+            faltantes.append("contrasena")
+        if faltantes:
+            raise Exception(
+                f"Faltan credenciales para grupo {etiqueta}: {faltantes}. "
+                "Configúralas en .env"
             )
-            context = browser.new_context(viewport=None, ignore_https_errors=True)
-            page = context.new_page()
-            page.evaluate("() => { window.moveTo(0, 0); window.resizeTo(screen.width, screen.height); }")
 
-            try:
-                page.goto(URL_LOGIN, wait_until="domcontentloaded", timeout=45000)
-                esperar_hasta_servicio_disponible(page, URL_LOGIN, espera_segundos=8)
-                print("1. Página de login cargada")
+    try:
+        trabajos_pendientes = obtener_trabajos_pendientes_excel(EXCEL_PATH)
+        if not trabajos_pendientes:
+            raise Exception("No hay registros Pendiente para procesar")
 
-                tab = page.locator(SEL["tab_tradicional"])
-                tab.wait_for(state="visible", timeout=8000)
-                tab.click()
-                print("2. Pestaña 'Autenticación Tradicional' seleccionada")
+        print(f"\n📚 Registros pendientes a procesar: {len(trabajos_pendientes)}")
 
-                page.locator(SEL["numero_documento"]).wait_for(state="visible", timeout=8000)
+        grupos_ordenados = ["SELVA", "JV", "OTRO"]
+        trabajos_por_grupo = {g: [] for g in grupos_ordenados}
+        for trabajo in trabajos_pendientes:
+            grupo = trabajo.get("ruc_grupo", "OTRO")
+            if grupo not in trabajos_por_grupo:
+                grupo = "OTRO"
+            trabajos_por_grupo[grupo].append(trabajo)
 
-                page.select_option(SEL["tipo_doc_select"], value=CREDENCIALES["tipo_documento_valor"])
-                # El onchange del tipo de documento dispara un update AJAX sobre el input documento.
-                # Esperamos que ese update termine antes de escribir para evitar valores parciales.
-                page.wait_for_timeout(450)
-                page.locator(SEL["numero_documento"]).wait_for(state="visible", timeout=8000)
-                escribir_input_jsf(page, SEL["numero_documento"], CREDENCIALES["numero_documento"])
-                escribir_input_rapido(page, SEL["usuario"], CREDENCIALES["usuario"])
-                escribir_input_rapido(page, SEL["clave"], CREDENCIALES["contrasena"])
-                print("✅ Credenciales llenadas")
+        for grupo_ruc in grupos_ordenados:
+            trabajos_grupo = trabajos_por_grupo.get(grupo_ruc, [])
+            if not trabajos_grupo:
+                continue
 
-                captcha_text = solve_captcha_ocr(page)
-                if captcha_text and len(captcha_text) == 5:
-                    escribir_input_rapido(page, SEL["captcha_input"], captcha_text)
-                    print(f"✅ CAPTCHA automático: {captcha_text}")
-                else:
-                    solve_captcha_manual(page)
+            credenciales_grupo = resolver_credenciales_por_grupo_ruc(grupo_ruc)
+            validar_credenciales_configuradas(credenciales_grupo, grupo_ruc)
 
-                print("🔘 Enviando login...")
-                page.locator(SEL["ingresar"]).click(timeout=10000)
+            print(f"\n🏢 Procesando grupo RUC {grupo_ruc} - Registros: {len(trabajos_grupo)}")
+            grupo_procesado = False
 
-                print("⏳ Validando acceso...")
-                url_ok, mensaje_error, tiempo_espera = validar_resultado_login_por_ui(page, timeout_ms=3000)
+            for intento_global in range(3):
+                start_time = time.time()
+                print(f"\n🔄 Intento login {intento_global+1}/3 para grupo {grupo_ruc}")
 
-                if url_ok:
+                if browser is not None:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+
+                browser = playwright.chromium.launch(
+                    headless=False,
+                    slow_mo=0,
+                    args=[
+                        "--start-maximized",
+                        "--disable-infobars",
+                        "--window-size=1920,1080",
+                        "--window-position=0,0"
+                    ]
+                )
+                context = browser.new_context(viewport=None, ignore_https_errors=True)
+                page = context.new_page()
+                page.evaluate("() => { window.moveTo(0, 0); window.resizeTo(screen.width, screen.height); }")
+
+                try:
+                    page.goto(URL_LOGIN, wait_until="domcontentloaded", timeout=45000)
+                    esperar_hasta_servicio_disponible(page, URL_LOGIN, espera_segundos=8)
+                    print("1. Página de login cargada")
+
+                    tab = page.locator(SEL["tab_tradicional"])
+                    tab.wait_for(state="visible", timeout=8000)
+                    tab.click()
+                    print("2. Pestaña 'Autenticación Tradicional' seleccionada")
+
+                    page.locator(SEL["numero_documento"]).wait_for(state="visible", timeout=8000)
+
+                    page.select_option(SEL["tipo_doc_select"], value=credenciales_grupo["tipo_documento_valor"])
+                    page.wait_for_timeout(450)
+                    page.locator(SEL["numero_documento"]).wait_for(state="visible", timeout=8000)
+                    escribir_input_jsf(page, SEL["numero_documento"], credenciales_grupo["numero_documento"])
+                    escribir_input_rapido(page, SEL["usuario"], credenciales_grupo["usuario"])
+                    escribir_input_rapido(page, SEL["clave"], credenciales_grupo["contrasena"])
+                    print(f"✅ Credenciales llenadas para grupo {grupo_ruc}")
+
+                    captcha_text = solve_captcha_ocr(page)
+                    if captcha_text and len(captcha_text) == 5:
+                        escribir_input_rapido(page, SEL["captcha_input"], captcha_text)
+                        print(f"✅ CAPTCHA automático: {captcha_text}")
+                    else:
+                        solve_captcha_manual(page)
+
+                    print("🔘 Enviando login...")
+                    page.locator(SEL["ingresar"]).click(timeout=10000)
+
+                    print("⏳ Validando acceso...")
+                    url_ok, mensaje_error, tiempo_espera = validar_resultado_login_por_ui(page, timeout_ms=3000)
+
+                    if not url_ok:
+                        print("❌ Login falló - no se detectó sesión autenticada")
+                        print(f"   → URL actual: {page.url}")
+                        if mensaje_error:
+                            print(f"   → Error detectado: {mensaje_error}")
+                        print(f"   ⏱️ Tiempo validación: {tiempo_espera:.2f} segundos")
+                        raise Exception("CAPTCHA incorrecto o credenciales inválidas")
+
                     total_time = time.time() - start_time
-                    print(f"🎉 ¡ACCESO EXITOSO!")
+                    print("🎉 ¡ACCESO EXITOSO!")
                     print(f"   → URL: {page.url}")
                     print(f"⏱️ Tiempo total login: {total_time:.2f} segundos")
                     login_exitoso = True
 
-                    # ── NAVEGAR A CITAS → RESERVAS DE CITAS ──────────────────
                     navegar_reservas_citas(page)
-
-                    # ── SELECCIONAR TIPO DE CITA: EXAMEN PARA POLÍGONO ───────
                     seleccionar_tipo_cita_poligono(page)
 
-                    indices_pendientes = obtener_indices_pendientes_excel(EXCEL_PATH)
-                    if not indices_pendientes:
-                        raise Exception("No hay registros Pendiente para procesar")
+                    for n, trabajo in enumerate(trabajos_grupo, start=1):
+                        idx_excel = trabajo["idx_excel"]
+                        print(
+                            f"\n━━━━━━━━ {grupo_ruc} Registro {n}/{len(trabajos_grupo)} "
+                            f"(idx={idx_excel}, prioridad={trabajo.get('prioridad', 'Normal')}) ━━━━━━━━"
+                        )
 
-                    print(f"\n📚 Registros pendientes a procesar: {len(indices_pendientes)}")
-
-                    for n, idx_excel in enumerate(indices_pendientes, start=1):
-                        print(f"\n━━━━━━━━ Registro {n}/{len(indices_pendientes)} (idx={idx_excel}) ━━━━━━━━")
-
-                        # Si el portal cae en medio de la operación, esperamos recuperación antes de continuar.
                         esperar_hasta_servicio_disponible(page, page.url, espera_segundos=8)
 
                         registro_excel = cargar_primer_registro_pendiente_desde_excel(
@@ -1987,33 +2107,17 @@ def llenar_login_sel():
                         )
 
                         try:
-                            # Tras Limpiar, en algunos casos se mantiene el mismo paso; en otros, conviene
-                            # reafirmar tipo de cita para garantizar contexto estable antes de sede/fecha.
                             try:
                                 page.locator(SEL["reserva_form"]).wait_for(state="visible", timeout=2500)
                             except Exception:
                                 seleccionar_tipo_cita_poligono(page)
 
-                            # ── COMPLETAR RESERVA DE CUPOS: SEDE Y FECHA (Excel) ─────
                             seleccionar_sede_y_fecha_desde_registro(page, registro_excel)
-
-                            # ── SELECCIONAR HORA (si hay cupos) Y AVANZAR ─────────────
                             seleccionar_hora_con_cupo_y_avanzar(page, registro_excel)
-
-                            # ── COMPLETAR PASO 2 (TIPO OP, DNI, SI, NRO SOLICITUD) ───
                             completar_paso_2_desde_registro(page, registro_excel)
-
-                            # ── FASE 2 FINAL: TABLA TIPO ARMA + SIGUIENTE ────────────
                             completar_tabla_tipos_arma_y_avanzar(page, registro_excel)
-
-                            # ── FASE 3: CAPTCHA RESUMEN + CHECK TÉRMINOS ─────────────
                             completar_fase_3_resumen(page)
 
-                            # ── PASO FINAL (DESACTIVADO) ─────────────────────────────
-                            # El agendado/generación final sigue comentado por control operativo.
-                            # generar_cita_final_con_reintento_rapido(page, max_intentos=3)
-
-                            # Requisito: tras flujo normal, limpiar y pasar al siguiente registro.
                             limpiar_para_siguiente_registro(page, motivo="fin de flujo")
                             total_ok += 1
 
@@ -2025,14 +2129,12 @@ def llenar_login_sel():
                                 registro_excel,
                                 f"No alcanzo cupo para horario {registro_excel.get('hora_rango', '')}"
                             )
-                            # En caso de cupo 0 ya se accionó Limpiar dentro de seleccionar_hora_con_cupo_y_avanzar.
                             continue
 
                         except Exception as e:
                             total_error += 1
                             print(f"❌ Error en registro idx={idx_excel}: {e}")
 
-                            # Si el horario no figura en la tabla de cupos, registrar observación en Excel.
                             error_txt = str(e or "")
                             if "No se encontró la hora objetivo en la tabla" in error_txt:
                                 registrar_sin_cupo_en_excel(
@@ -2044,33 +2146,44 @@ def llenar_login_sel():
                                     ),
                                 )
 
-                            # Intento de recuperación para seguir con el siguiente registro.
+                            if "documento vigilante" in error_txt.lower():
+                                registrar_sin_cupo_en_excel(
+                                    EXCEL_PATH,
+                                    registro_excel,
+                                    (
+                                        "Documento vigilante no disponible para esta razón social/RUC. "
+                                        f"DNI={registro_excel.get('doc_vigilante', '')} | "
+                                        f"RUC={registro_excel.get('ruc', '')}"
+                                    ),
+                                )
+
                             try:
                                 limpiar_para_siguiente_registro(page, motivo="recuperación por error")
                             except Exception:
                                 pass
                             continue
 
-                    duracion_total_flujo = time.time() - inicio_total_flujo
-                    print(f"\n⏱️ Tiempo total del flujo: {duracion_total_flujo:.2f} segundos")
-                    print(f"📊 Resumen: OK={total_ok} | SIN_CUPO={total_sin_cupo} | ERROR={total_error}")
-
+                    grupo_procesado = True
                     break
-                else:
-                    print(f"❌ Login falló - no se detectó sesión autenticada")
-                    print(f"   → URL actual: {page.url}")
-                    if mensaje_error:
-                        print(f"   → Error detectado: {mensaje_error}")
-                    print(f"   ⏱️ Tiempo validación: {tiempo_espera:.2f} segundos")
-                    raise Exception("CAPTCHA incorrecto o credenciales inválidas")
 
-            except Exception as e:
-                print(f"❌ Intento {intento_global+1} falló: {e}")
-                if intento_global < 2:
-                    print("   Reintentando...")
-                    time.sleep(1)
-                else:
-                    print("   Se agotaron los 3 intentos")
+                except Exception as e:
+                    print(f"❌ Intento {intento_global+1} para grupo {grupo_ruc} falló: {e}")
+                    if intento_global < 2:
+                        print("   Reintentando...")
+                        time.sleep(1)
+                    else:
+                        print("   Se agotaron los 3 intentos para este grupo")
+
+            if not grupo_procesado:
+                total_error += len(trabajos_grupo)
+                print(
+                    f"⚠️ No se pudo procesar el grupo {grupo_ruc}. "
+                    f"Se contabilizan {len(trabajos_grupo)} registros con error."
+                )
+
+        duracion_total_flujo = time.time() - inicio_total_flujo
+        print(f"\n⏱️ Tiempo total del flujo: {duracion_total_flujo:.2f} segundos")
+        print(f"📊 Resumen: OK={total_ok} | SIN_CUPO={total_sin_cupo} | ERROR={total_error}")
 
         if login_exitoso:
             print("\n✅ Flujo completado. Navegador abierto para uso manual.")
