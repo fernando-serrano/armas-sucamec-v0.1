@@ -5,6 +5,7 @@ import time
 import re
 import unicodedata
 import itertools
+from datetime import date
 
 try:
     import pandas as pd
@@ -911,7 +912,11 @@ def fecha_comparable(valor_fecha: str) -> str:
 
 
 def obtener_indices_pendientes_excel(ruta_excel: str) -> list:
-    """Devuelve los índices de filas con estado Pendiente."""
+    """
+    Devuelve índices de trabajo (únicos) en estado Pendiente.
+    Deduplica por doc_vigilante+dni, nro_solicitud y fecha_programacion/fecha,
+    para evitar reprocesar registros que pertenecen a una misma cita/iteración.
+    """
     if pd is None:
         raise Exception("Falta dependencia 'pandas'. Instala con: pip install pandas openpyxl")
     if not os.path.exists(ruta_excel):
@@ -923,8 +928,45 @@ def obtener_indices_pendientes_excel(ruta_excel: str) -> list:
         raise Exception("El Excel no contiene la columna 'estado'")
 
     df["estado"] = df["estado"].fillna("").astype(str).apply(limpiar_valor_excel)
+    if "doc_vigilante" not in df.columns:
+        df["doc_vigilante"] = ""
+    if "dni" not in df.columns:
+        df["dni"] = ""
+    if "nro_solicitud" not in df.columns:
+        df["nro_solicitud"] = ""
+    fecha_col_programacion = "fecha_programacion" if "fecha_programacion" in df.columns else "fecha"
+
+    # Limpieza mínima para claves de deduplicación.
+    for c in ["doc_vigilante", "dni", "nro_solicitud", fecha_col_programacion]:
+        if c in df.columns:
+            df[c] = df[c].fillna("").astype(str).apply(limpiar_valor_excel)
+
     pendientes = df[df["estado"].str.upper().str.contains("PENDIENTE", na=False)]
-    return list(pendientes.index)
+    if pendientes.empty:
+        return []
+
+    # Por defecto, procesar solo fecha de programación de hoy.
+    # Puede desactivarse explícitamente con VALIDAR_FECHA_PROGRAMACION_HOY=0.
+    validar_hoy = os.getenv("VALIDAR_FECHA_PROGRAMACION_HOY", "1").strip().lower() in {"1", "true", "si", "sí", "yes"}
+    if validar_hoy:
+        hoy = date.today().strftime("%d/%m/%Y")
+        pendientes = pendientes[
+            pendientes[fecha_col_programacion].apply(fecha_comparable) == hoy
+        ]
+
+    indices_unicos = []
+    claves_vistas = set()
+    for idx, fila in pendientes.iterrows():
+        doc = str(fila.get("doc_vigilante", "") or fila.get("dni", "")).strip()
+        nro = str(fila.get("nro_solicitud", "")).strip()
+        fecha_prog = fecha_comparable(fila.get(fecha_col_programacion, fila.get("fecha", "")))
+        clave = (doc, nro, fecha_prog)
+        if clave in claves_vistas:
+            continue
+        claves_vistas.add(clave)
+        indices_unicos.append(idx)
+
+    return indices_unicos
 
 
 def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str, indice_excel_objetivo: int = None) -> dict:
@@ -962,6 +1004,7 @@ def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str, indice_excel_o
     registro["_excel_path"] = ruta_excel
 
     fecha_col_programacion = "fecha_programacion" if "fecha_programacion" in df.columns else "fecha"
+    fecha_programacion_valor = fecha_comparable(registro.get(fecha_col_programacion, registro.get("fecha", "")))
 
     sede = registro.get("sede", "").strip()
     fecha = normalizar_fecha_excel(registro.get("fecha", ""))
@@ -981,28 +1024,33 @@ def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str, indice_excel_o
     if not arma_base:
         raise Exception("El registro pendiente no tiene 'arma'")
 
-    # Agrupa posibles duplicados de la misma programación (mismo usuario + misma fecha_programacion/fecha).
+    # Agrupa registros de la misma programación/cita:
+    # mismo usuario + misma solicitud + misma fecha_programacion/fecha.
     fecha_base = fecha_comparable(registro.get(fecha_col_programacion, registro.get("fecha", "")))
     doc_base = doc_vigilante
+    nro_base = nro_solicitud
     pendientes_aux = pendientes.copy()
     pendientes_aux["fecha_norm"] = pendientes_aux[fecha_col_programacion].apply(fecha_comparable)
     pendientes_aux["doc_norm"] = pendientes_aux.apply(
         lambda r: str(r.get("doc_vigilante", "") or r.get("dni", "")).strip(), axis=1
     )
+    pendientes_aux["nro_norm"] = pendientes_aux["nro_solicitud"].apply(lambda v: str(v or "").strip())
     relacionados = pendientes_aux[
         (pendientes_aux["fecha_norm"] == fecha_base) &
-        (pendientes_aux["doc_norm"] == doc_base)
+        (pendientes_aux["doc_norm"] == doc_base) &
+        (pendientes_aux["nro_norm"] == nro_base)
     ]
 
-    # Validación adicional solicitada: revisar explícitamente el siguiente registro.
+    # Validación adicional: revisar explícitamente el siguiente registro.
     siguiente_mismo_doc_y_fecha = False
     siguiente_idx = indice_primer_pendiente + 1
     if siguiente_idx in df.index:
         fila_sig = df.loc[siguiente_idx]
         estado_sig = str(fila_sig.get("estado", "")).strip().upper()
         doc_sig = str(fila_sig.get("doc_vigilante", "") or fila_sig.get("dni", "")).strip()
+        nro_sig = str(fila_sig.get("nro_solicitud", "")).strip()
         fecha_sig = fecha_comparable(fila_sig.get(fecha_col_programacion, fila_sig.get("fecha", "")))
-        if estado_sig == "PENDIENTE" and doc_sig == doc_base and fecha_sig == fecha_base:
+        if estado_sig == "PENDIENTE" and doc_sig == doc_base and nro_sig == nro_base and fecha_sig == fecha_base:
             siguiente_mismo_doc_y_fecha = True
 
     tipos_arma_excel = []
@@ -1069,6 +1117,7 @@ def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str, indice_excel_o
     registro["fecha"] = fecha
     registro["hora_rango"] = hora_rango
     registro["doc_vigilante"] = doc_vigilante
+    registro["fecha_programacion"] = fecha_programacion_valor
     registro["objetivos_arma"] = objetivos_arma
     registro["tipos_arma_objetivo"] = tipos_arma_objetivo
     registro["armas_objetivo"] = armas_excel
@@ -1081,7 +1130,7 @@ def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str, indice_excel_o
     print(f"   • tipo_operacion: {tipo_operacion}")
     print(f"   • doc_vigilante: {doc_vigilante}")
     print(f"   • nro_solicitud: {nro_solicitud}")
-    print(f"   • fecha_col_programacion: {fecha_col_programacion}")
+    print(f"   • fecha_programacion: {fecha_programacion_valor}")
     print(f"   • siguiente_mismo_doc_y_fecha: {siguiente_mismo_doc_y_fecha}")
     print(f"   • tipo_arma (excel): {tipos_arma_excel}")
     print(f"   • arma (excel): {armas_excel}")
@@ -1982,6 +2031,19 @@ def llenar_login_sel():
                         except Exception as e:
                             total_error += 1
                             print(f"❌ Error en registro idx={idx_excel}: {e}")
+
+                            # Si el horario no figura en la tabla de cupos, registrar observación en Excel.
+                            error_txt = str(e or "")
+                            if "No se encontró la hora objetivo en la tabla" in error_txt:
+                                registrar_sin_cupo_en_excel(
+                                    EXCEL_PATH,
+                                    registro_excel,
+                                    (
+                                        "Horario no figura en la tabla de cupos: "
+                                        f"{registro_excel.get('hora_rango', '')}"
+                                    ),
+                                )
+
                             # Intento de recuperación para seguir con el siguiente registro.
                             try:
                                 limpiar_para_siguiente_registro(page, motivo="recuperación por error")
