@@ -80,6 +80,7 @@ SEL = {
     "tabla_programacion": '#tabGestion\\:creaCitaPolJurForm\\:dtProgramacion',
     "tabla_programacion_rows": '#tabGestion\\:creaCitaPolJurForm\\:dtProgramacion_data tr',
     "boton_siguiente": '#tabGestion\\:creaCitaPolJurForm button:has-text("Siguiente")',
+    "boton_limpiar": '#tabGestion\\:creaCitaPolJurForm\\:botonLimpiar',
 
     # ── Paso 2 del Wizard ───────────────────────────────────────────────────
     "tipo_operacion_trigger": '#tabGestion\\:creaCitaPolJurForm\\:tipoOpe .ui-selectonemenu-trigger',
@@ -111,6 +112,10 @@ SEL = {
     "fase3_terminos_input": '#tabGestion\\:creaCitaPolJurForm\\:terminos_input',
     "fase3_boton_generar_cita": '#tabGestion\\:creaCitaPolJurForm\\:j_idt561',
 }
+
+
+class SinCupoError(Exception):
+    """Se lanza cuando la hora objetivo existe pero no tiene cupos libres."""
 
 
 # ============================================================
@@ -860,6 +865,8 @@ def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str) -> dict:
 
     indice_primer_pendiente = pendientes.index[0]
     registro = pendientes.loc[indice_primer_pendiente].to_dict()
+    registro["_excel_index"] = int(indice_primer_pendiente)
+    registro["_excel_path"] = ruta_excel
 
     fecha_col_programacion = "fecha_programacion" if "fecha_programacion" in df.columns else "fecha"
 
@@ -988,6 +995,62 @@ def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str) -> dict:
     print(f"   • objetivos_arma: {objetivos_arma}")
     print(f"   • tipos_arma_objetivo: {tipos_arma_objetivo}")
     return registro
+
+
+def registrar_sin_cupo_en_excel(ruta_excel: str, registro: dict, observacion: str):
+    """Registra observación de sin cupo en Excel sin modificar el estado actual."""
+    if pd is None:
+        return
+    if not ruta_excel or not os.path.exists(ruta_excel):
+        return
+
+    try:
+        df = pd.read_excel(ruta_excel, dtype=str)
+        df.columns = [str(c).strip() for c in df.columns]
+
+        col_obs = "observaciones" if "observaciones" in df.columns else (
+            "observacion" if "observacion" in df.columns else "observaciones"
+        )
+        if col_obs not in df.columns:
+            df[col_obs] = ""
+
+        idx = registro.get("_excel_index", None)
+        actualizado = False
+
+        if idx is not None and idx in df.index:
+            df.loc[idx, col_obs] = observacion
+            actualizado = True
+        else:
+            # Fallback por coincidencia de campos claves.
+            sede = str(registro.get("sede", "")).strip()
+            fecha = str(registro.get("fecha", "")).strip()
+            hora = str(registro.get("hora_rango", "")).strip()
+            nro = str(registro.get("nro_solicitud", "")).strip()
+
+            def col_norm(nombre_col: str):
+                if nombre_col in df.columns:
+                    return df[nombre_col].fillna("").astype(str).str.strip()
+                return pd.Series([""] * len(df), index=df.index)
+
+            mask = (
+                (col_norm("sede") == sede) &
+                (col_norm("fecha") == fecha) &
+                (col_norm("hora_rango") == hora) &
+                (col_norm("nro_solicitud") == nro)
+            )
+            candidatos = df[mask]
+            if not candidatos.empty:
+                idx2 = candidatos.index[0]
+                df.loc[idx2, col_obs] = observacion
+                actualizado = True
+
+        if actualizado:
+            df.to_excel(ruta_excel, index=False)
+            print(f"   📝 Excel actualizado: {col_obs}='{observacion}'")
+        else:
+            print("   ⚠️ No se pudo ubicar el registro en Excel para actualizar observación de sin cupo")
+    except Exception as e:
+        print(f"   ⚠️ No se pudo actualizar Excel con observación de sin cupo: {e}")
 
 
 def seleccionar_en_selectonemenu(page, trigger_selector: str, panel_selector: str, label_selector: str, valor: str, nombre_campo: str):
@@ -1238,22 +1301,69 @@ def seleccionar_hora_con_cupo_y_avanzar(page, registro: dict):
     filas = page.locator(SEL["tabla_programacion_rows"])
     total_filas = filas.count()
     if total_filas == 0:
+        # Fallback para tablas PrimeFaces donde el sufijo _data no aparece en todos los entornos.
+        filas = page.locator(f"{SEL['tabla_programacion']} tbody tr")
+        total_filas = filas.count()
+    if total_filas == 0:
         raise Exception("La tabla de programación no tiene filas para la fecha/sede seleccionadas")
 
     fila_objetivo = None
     cupos_objetivo = 0
     resumen = []
 
+    def extraer_hora_rango_desde_texto(texto: str) -> str:
+        t = str(texto or "").replace(".", ":")
+        m = re.search(r"(\d{1,2}:\d{2})\s*[-–—]\s*(\d{1,2}:\d{2})", t)
+        if m:
+            ini = normalizar_hora_fragmento(m.group(1))
+            fin = normalizar_hora_fragmento(m.group(2))
+            return f"{ini}-{fin}"
+        return normalizar_hora_rango(t)
+
+    def extraer_cupos_desde_celdas(textos_celdas: list) -> int:
+        # Busca el último texto numérico que no sea rango horario.
+        for txt in reversed(textos_celdas):
+            t = str(txt or "").strip()
+            if not t or ":" in t:
+                continue
+            if re.search(r"\d+", t):
+                return convertir_a_entero(t)
+        return 0
+
+    def click_boton_limpiar_obligatorio():
+        try:
+            boton_limpiar = page.locator(SEL["boton_limpiar"])
+            boton_limpiar.wait_for(state="visible", timeout=7000)
+            boton_limpiar.first.click(timeout=7000)
+            page.wait_for_timeout(350)
+            print("   ✓ Click en botón 'Limpiar' por falta de cupos")
+        except Exception as e:
+            raise SinCupoError(f"No se pudo accionar el botón 'Limpiar' tras detectar cupo 0: {e}")
+
     for i in range(total_filas):
         fila = filas.nth(i)
         celdas = fila.locator("td")
-        if celdas.count() < 3:
+        total_celdas = celdas.count()
+        if total_celdas == 0:
             continue
 
-        hora_tabla = normalizar_hora_rango(celdas.nth(0).inner_text().strip())
-        cupos_texto = celdas.nth(1).inner_text().strip()
-        cupos = convertir_a_entero(cupos_texto)
-        resumen.append(f"{hora_tabla} ({cupos})")
+        textos_celdas = []
+        for j in range(total_celdas):
+            try:
+                textos_celdas.append((celdas.nth(j).inner_text() or "").strip())
+            except Exception:
+                textos_celdas.append("")
+
+        hora_tabla = ""
+        for txt in textos_celdas:
+            cand = extraer_hora_rango_desde_texto(txt)
+            if cand and "-" in cand and re.search(r"\d{2}:\d{2}-\d{2}:\d{2}", cand):
+                hora_tabla = cand
+                break
+
+        cupos = extraer_cupos_desde_celdas(textos_celdas)
+        if hora_tabla:
+            resumen.append(f"{hora_tabla} ({cupos})")
 
         if hora_tabla == hora_objetivo:
             fila_objetivo = fila
@@ -1267,7 +1377,8 @@ def seleccionar_hora_con_cupo_y_avanzar(page, registro: dict):
         )
 
     if cupos_objetivo <= 0:
-        raise Exception(f"La hora '{hora_objetivo}' no tiene cupos disponibles (Cupos Libres={cupos_objetivo})")
+        click_boton_limpiar_obligatorio()
+        raise SinCupoError(f"La hora '{hora_objetivo}' no tiene cupos disponibles (Cupos Libres={cupos_objetivo})")
 
     radio_box = fila_objetivo.locator("td.ui-selection-column div.ui-radiobutton-box")
     if radio_box.count() == 0:
@@ -1641,6 +1752,8 @@ def llenar_login_sel():
     playwright = sync_playwright().start()
     browser = None
     login_exitoso = False
+    no_cupo_detectado = False
+    mensaje_sin_cupo = ""
 
     try:
         for intento_global in range(3):
@@ -1746,6 +1859,17 @@ def llenar_login_sel():
                     print(f"   ⏱️ Tiempo validación: {tiempo_espera:.2f} segundos")
                     raise Exception("CAPTCHA incorrecto o credenciales inválidas")
 
+            except SinCupoError as e:
+                no_cupo_detectado = True
+                mensaje_sin_cupo = str(e)
+                print(f"⛔ Flujo detenido por falta de cupos: {mensaje_sin_cupo}")
+                registrar_sin_cupo_en_excel(
+                    EXCEL_PATH,
+                    registro_excel,
+                    f"No alcanzo cupo para horario {registro_excel.get('hora_rango', '')}"
+                )
+                break
+
             except Exception as e:
                 print(f"❌ Intento {intento_global+1} falló: {e}")
                 if intento_global < 2:
@@ -1764,21 +1888,35 @@ def llenar_login_sel():
                     time.sleep(60)
             except KeyboardInterrupt:
                 print("\n🛑 Interrupción manual. Cerrando navegador...")
+        elif no_cupo_detectado:
+            print("\n⛔ Flujo detenido: no hay cupos libres para la hora solicitada.")
+            if mensaje_sin_cupo:
+                print(f"   → Detalle: {mensaje_sin_cupo}")
+            print("   Navegador queda abierto para revisión manual.")
+            print("   Presiona Ctrl+C cuando quieras finalizar el script.")
+            try:
+                while True:
+                    time.sleep(60)
+            except KeyboardInterrupt:
+                print("\n🛑 Interrupción manual. Fin del script (sin cierre automático del navegador).")
         else:
             print("\n❌ No se pudo completar el login después de todos los intentos.")
             input("   Presiona ENTER para cerrar el navegador...")
 
     finally:
-        try:
-            if browser is not None:
-                browser.close() 
-        except Exception:
-            pass
-        try:
-            playwright.stop()
-        except Exception:
-            pass
-        print("Navegador cerrado.")
+        if no_cupo_detectado:
+            print("Navegador no cerrado automáticamente (caso sin cupo).")
+        else:
+            try:
+                if browser is not None:
+                    browser.close()
+            except Exception:
+                pass
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+            print("Navegador cerrado.")
 
 
 if __name__ == "__main__":
