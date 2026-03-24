@@ -1538,12 +1538,30 @@ def llenar_login_sel():
                 page.locator(SEL["ingresar"]).click(timeout=10000)
 
                 print("⏳ Validando acceso...")
+                tiempo_validacion_inicio = time.time()
                 url_ok = False
-                for _ in range(50):
-                    if "/aplicacion/" in page.url:
-                        url_ok = True
-                        break
-                    page.wait_for_timeout(200)
+                mensaje_error = None
+                
+                try:
+                    # Esperamos máximo 1 segundo para el cambio de URL (debe ser rápido si es exitoso)
+                    page.wait_for_url("**/aplicacion/**", timeout=1000)
+                    url_ok = True
+                except PlaywrightTimeoutError:
+                    # Si falló, verificamos si hay un mensaje de error visible
+                    try:
+                        # Buscamos mensajes de error comunes en la página
+                        error_elements = page.locator("[class*='error'], [class*='Error'], .ui-messages-error, .mensajeError").all()
+                        if error_elements:
+                            for elem in error_elements:
+                                try:
+                                    msg = elem.inner_text().strip()
+                                    if msg:
+                                        mensaje_error = msg
+                                        break
+                                except:
+                                    pass
+                    except:
+                        pass
 
                 if url_ok:
                     total_time = time.time() - start_time
@@ -1578,8 +1596,12 @@ def llenar_login_sel():
 
                     break
                 else:
+                    tiempo_espera = time.time() - tiempo_validacion_inicio
                     print(f"❌ Login falló - URL NO cambió a /aplicacion/")
                     print(f"   → URL actual: {page.url}")
+                    if mensaje_error:
+                        print(f"   → Error detectado: {mensaje_error}")
+                    print(f"   ⏱️ Tiempo validación: {tiempo_espera:.2f} segundos")
                     raise Exception("CAPTCHA incorrecto o credenciales inválidas")
 
             except Exception as e:
