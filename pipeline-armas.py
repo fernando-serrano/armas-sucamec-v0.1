@@ -5,7 +5,7 @@ import time
 import re
 import unicodedata
 import itertools
-from datetime import date
+from datetime import date, datetime, timedelta
 
 try:
     import pandas as pd
@@ -18,7 +18,9 @@ try:
     from PIL import Image, ImageFilter, ImageEnhance, ImageOps
     from io import BytesIO
     import pytesseract
+    # ==================== RUTA IMPORTANTE DEL TESSERACT (ajusta según tu instalación) ============================
     pytesseract.pytesseract.tesseract_cmd = r'C:\Users\fserrano\AppData\Local\Programs\Tesseract-OCR\tesseract.exe'
+    # =============================================================================================================
     OCR_AVAILABLE = True
     print("✅ OCR (pytesseract) cargado correctamente")
 except ImportError:
@@ -29,7 +31,8 @@ except Exception as e:
 load_dotenv()
 
 URL_LOGIN = "https://www.sucamec.gob.pe/sel/faces/login.xhtml?faces-redirect=true"
-EXCEL_PATH = os.getenv("EXCEL_PATH", os.path.join("data", "programaciones-armas.xlsx"))
+script_dir = os.path.dirname(os.path.abspath(__file__))
+EXCEL_PATH = os.getenv("EXCEL_PATH", os.path.join(script_dir, "data", "programaciones-armas.xlsx"))
 
 CREDENCIALES = {
     "tipo_documento_valor": os.getenv("TIPO_DOC", "RUC"),
@@ -981,15 +984,19 @@ def obtener_trabajos_pendientes_excel(ruta_excel: str) -> list:
         raise Exception("El Excel no contiene columna de fecha (fecha_programacion/fecha)")
 
     pendientes = df[df["estado"].str.upper().str.contains("PENDIENTE", na=False)].copy()
+    print(f"   → Registros con estado 'PENDIENTE': {len(pendientes)}")
     if pendientes.empty:
         return []
 
     validar_hoy = os.getenv("VALIDAR_FECHA_PROGRAMACION_HOY", "1").strip().lower() in {"1", "true", "si", "sí", "yes"}
     if validar_hoy:
         hoy = date.today().strftime("%d/%m/%Y")
+        print(f"   → Validando fecha de hoy: {hoy}")
+        pendientes_antes = len(pendientes)
         pendientes = pendientes[
             pendientes[fecha_col_programacion].apply(fecha_comparable) == hoy
         ]
+        print(f"   → Registros después de filtrar por fecha: {len(pendientes)} (filtrados: {pendientes_antes - len(pendientes)})")
         if pendientes.empty:
             return []
 
@@ -1275,6 +1282,60 @@ def registrar_sin_cupo_en_excel(ruta_excel: str, registro: dict, observacion: st
             print("   ⚠️ No se pudo ubicar el registro en Excel para actualizar observación de sin cupo")
     except Exception as e:
         print(f"   ⚠️ No se pudo actualizar Excel con observación de sin cupo: {e}")
+
+
+def registrar_cita_programada_en_excel(ruta_excel: str, registro: dict):
+    """Actualiza el estado del registro en Excel a 'Cita Programada'."""
+    if pd is None:
+        return
+    if not ruta_excel or not os.path.exists(ruta_excel):
+        return
+
+    try:
+        df = pd.read_excel(ruta_excel, dtype=str)
+        df.columns = [str(c).strip() for c in df.columns]
+
+        if "estado" not in df.columns:
+            print("   ⚠️ Columna 'estado' no encontrada en Excel")
+            return
+
+        idx = registro.get("_excel_index", None)
+        actualizado = False
+
+        if idx is not None and idx in df.index:
+            df.loc[idx, "estado"] = "Cita Programada"
+            actualizado = True
+        else:
+            # Fallback por coincidencia de campos claves.
+            sede = str(registro.get("sede", "")).strip()
+            fecha = str(registro.get("fecha", "")).strip()
+            hora = str(registro.get("hora_rango", "")).strip()
+            nro = str(registro.get("nro_solicitud", "")).strip()
+
+            def col_norm(nombre_col: str):
+                if nombre_col in df.columns:
+                    return df[nombre_col].fillna("").astype(str).str.strip()
+                return pd.Series([""] * len(df), index=df.index)
+
+            mask = (
+                (col_norm("sede") == sede) &
+                (col_norm("fecha") == fecha) &
+                (col_norm("hora_rango") == hora) &
+                (col_norm("nro_solicitud") == nro)
+            )
+            candidatos = df[mask]
+            if not candidatos.empty:
+                idx2 = candidatos.index[0]
+                df.loc[idx2, "estado"] = "Cita Programada"
+                actualizado = True
+
+        if actualizado:
+            df.to_excel(ruta_excel, index=False)
+            print("   ✅ Excel actualizado: estado='Cita Programada'")
+        else:
+            print(f"   ⚠️ No se pudo ubicar el registro en Excel para actualizar estado. _excel_index={idx}, sede={sede}, fecha={fecha}, hora={hora}, nro={nro}")
+    except Exception as e:
+        print(f"   ⚠️ No se pudo actualizar Excel con estado 'Cita Programada': {e}")
 
 
 def seleccionar_en_selectonemenu(page, trigger_selector: str, panel_selector: str, label_selector: str, valor: str, nombre_campo: str):
@@ -1995,7 +2056,8 @@ def llenar_login_sel():
     try:
         trabajos_pendientes = obtener_trabajos_pendientes_excel(EXCEL_PATH)
         if not trabajos_pendientes:
-            raise Exception("No hay registros Pendiente para procesar")
+            print("\n📚 No hay registros pendientes para procesar. Todos los registros han sido procesados o marcados.")
+            return
 
         print(f"\n📚 Registros pendientes a procesar: {len(trabajos_pendientes)}")
 
@@ -2018,9 +2080,11 @@ def llenar_login_sel():
             print(f"\n🏢 Procesando grupo RUC {grupo_ruc} - Registros: {len(trabajos_grupo)}")
             grupo_procesado = False
 
-            for intento_global in range(3):
+            intento_global = 0
+            while True:
                 start_time = time.time()
-                print(f"\n🔄 Intento login {intento_global+1}/3 para grupo {grupo_ruc}")
+                intento_global += 1
+                print(f"\n🔄 Intento login {intento_global} (sin límite) para grupo {grupo_ruc}")
 
                 if browser is not None:
                     try:
@@ -2118,6 +2182,12 @@ def llenar_login_sel():
                             completar_tabla_tipos_arma_y_avanzar(page, registro_excel)
                             completar_fase_3_resumen(page)
 
+                            # Generar la cita con reintentos si el captcha falla
+                            generar_cita_final_con_reintento_rapido(page, max_intentos=5)
+
+                            # Marcar como cita programada en Excel
+                            registrar_cita_programada_en_excel(EXCEL_PATH, registro_excel)
+
                             limpiar_para_siguiente_registro(page, motivo="fin de flujo")
                             total_ok += 1
 
@@ -2146,7 +2216,7 @@ def llenar_login_sel():
                                     ),
                                 )
 
-                            if "documento vigilante" in error_txt.lower():
+                            elif "documento vigilante" in error_txt.lower():
                                 registrar_sin_cupo_en_excel(
                                     EXCEL_PATH,
                                     registro_excel,
@@ -2155,6 +2225,14 @@ def llenar_login_sel():
                                         f"DNI={registro_excel.get('doc_vigilante', '')} | "
                                         f"RUC={registro_excel.get('ruc', '')}"
                                     ),
+                                )
+
+                            else:
+                                # Registrar otros errores en Excel
+                                registrar_sin_cupo_en_excel(
+                                    EXCEL_PATH,
+                                    registro_excel,
+                                    f"Error en procesamiento: {error_txt}"
                                 )
 
                             try:
