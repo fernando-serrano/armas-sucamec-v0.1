@@ -926,6 +926,44 @@ def normalizar_ruc_operativo(valor_ruc: str) -> str:
     return normalizar_texto_comparable(limpiar_valor_excel(valor_ruc))
 
 
+def obtener_indices_relacionados_registro(registro: dict) -> list:
+    """Devuelve índices de Excel asociados al registro actual (sin duplicados)."""
+    indices = []
+    for idx in registro.get("_excel_indices_relacionados", []) or []:
+        try:
+            indices.append(int(idx))
+        except Exception:
+            continue
+
+    idx_principal = registro.get("_excel_index", None)
+    try:
+        if idx_principal is not None:
+            indices.append(int(idx_principal))
+    except Exception:
+        pass
+
+    return sorted(set(indices))
+
+
+def clasificar_motivo_detencion(error: BaseException) -> str:
+    """Clasifica cierres/interrupciones para logs operativos más claros."""
+    if isinstance(error, KeyboardInterrupt):
+        return "INTERRUPCION_MANUAL"
+
+    texto = str(error or "").lower()
+    señales_cierre = [
+        "target page, context or browser has been closed",
+        "browser has been closed",
+        "context closed",
+        "page closed",
+        "connection closed",
+    ]
+    if any(s in texto for s in señales_cierre):
+        return "VENTANA_CERRADA"
+
+    return ""
+
+
 def obtener_grupo_ruc(valor_ruc: str) -> str:
     """Clasifica el RUC/razón social en SELVA, JV u OTRO."""
     base = normalizar_ruc_operativo(valor_ruc)
@@ -1125,6 +1163,10 @@ def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str, indice_excel_o
         (pendientes_aux["doc_norm"] == doc_base) &
         (pendientes_aux["nro_norm"] == nro_base)
     ]
+    indices_relacionados = [int(i) for i in relacionados.index.tolist()]
+    if int(indice_primer_pendiente) not in indices_relacionados:
+        indices_relacionados.append(int(indice_primer_pendiente))
+    indices_relacionados = sorted(set(indices_relacionados))
 
     # Validación adicional: revisar explícitamente el siguiente registro.
     siguiente_mismo_doc_y_fecha = False
@@ -1208,6 +1250,7 @@ def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str, indice_excel_o
     registro["objetivos_arma"] = objetivos_arma
     registro["tipos_arma_objetivo"] = tipos_arma_objetivo
     registro["armas_objetivo"] = armas_excel
+    registro["_excel_indices_relacionados"] = indices_relacionados
 
     print("📄 Registro tomado desde Excel:")
     print(f"   • id_registro: {registro.get('id_registro', '')}")
@@ -1221,6 +1264,7 @@ def cargar_primer_registro_pendiente_desde_excel(ruta_excel: str, indice_excel_o
     print(f"   • ruc: {registro.get('ruc', '')}")
     print(f"   • prioridad: {registro.get('prioridad', '')}")
     print(f"   • siguiente_mismo_doc_y_fecha: {siguiente_mismo_doc_y_fecha}")
+    print(f"   • indices_relacionados_excel: {indices_relacionados}")
     print(f"   • tipo_arma (excel): {tipos_arma_excel}")
     print(f"   • arma (excel): {armas_excel}")
     print(f"   • objetivos_arma: {objetivos_arma}")
@@ -1246,11 +1290,15 @@ def registrar_sin_cupo_en_excel(ruta_excel: str, registro: dict, observacion: st
             df[col_obs] = ""
 
         idx = registro.get("_excel_index", None)
+        indices_rel = obtener_indices_relacionados_registro(registro)
         actualizado = False
+        total_actualizados = 0
 
-        if idx is not None and idx in df.index:
-            df.loc[idx, col_obs] = observacion
+        indices_validos = [i for i in indices_rel if i in df.index]
+        if indices_validos:
+            df.loc[indices_validos, col_obs] = observacion
             actualizado = True
+            total_actualizados = len(indices_validos)
         else:
             # Fallback por coincidencia de campos claves.
             sede = str(registro.get("sede", "")).strip()
@@ -1269,17 +1317,23 @@ def registrar_sin_cupo_en_excel(ruta_excel: str, registro: dict, observacion: st
                 (col_norm("hora_rango") == hora) &
                 (col_norm("nro_solicitud") == nro)
             )
-            candidatos = df[mask]
-            if not candidatos.empty:
-                idx2 = candidatos.index[0]
-                df.loc[idx2, col_obs] = observacion
+            idx_candidatos = df[mask].index.tolist()
+            if idx_candidatos:
+                df.loc[idx_candidatos, col_obs] = observacion
                 actualizado = True
+                total_actualizados = len(idx_candidatos)
 
         if actualizado:
             df.to_excel(ruta_excel, index=False)
-            print(f"   📝 Excel actualizado: {col_obs}='{observacion}'")
+            print(
+                f"   📝 Excel actualizado: {col_obs}='{observacion}' "
+                f"en {total_actualizados} fila(s)"
+            )
         else:
-            print("   ⚠️ No se pudo ubicar el registro en Excel para actualizar observación de sin cupo")
+            print(
+                "   ⚠️ No se pudo ubicar el registro en Excel para actualizar observación. "
+                f"_excel_index={idx}, indices_rel={indices_rel}"
+            )
     except Exception as e:
         print(f"   ⚠️ No se pudo actualizar Excel con observación de sin cupo: {e}")
 
@@ -1300,11 +1354,15 @@ def registrar_cita_programada_en_excel(ruta_excel: str, registro: dict):
             return
 
         idx = registro.get("_excel_index", None)
+        indices_rel = obtener_indices_relacionados_registro(registro)
         actualizado = False
+        total_actualizados = 0
 
-        if idx is not None and idx in df.index:
-            df.loc[idx, "estado"] = "Cita Programada"
+        indices_validos = [i for i in indices_rel if i in df.index]
+        if indices_validos:
+            df.loc[indices_validos, "estado"] = "Cita Programada"
             actualizado = True
+            total_actualizados = len(indices_validos)
         else:
             # Fallback por coincidencia de campos claves.
             sede = str(registro.get("sede", "")).strip()
@@ -1323,17 +1381,20 @@ def registrar_cita_programada_en_excel(ruta_excel: str, registro: dict):
                 (col_norm("hora_rango") == hora) &
                 (col_norm("nro_solicitud") == nro)
             )
-            candidatos = df[mask]
-            if not candidatos.empty:
-                idx2 = candidatos.index[0]
-                df.loc[idx2, "estado"] = "Cita Programada"
+            idx_candidatos = df[mask].index.tolist()
+            if idx_candidatos:
+                df.loc[idx_candidatos, "estado"] = "Cita Programada"
                 actualizado = True
+                total_actualizados = len(idx_candidatos)
 
         if actualizado:
             df.to_excel(ruta_excel, index=False)
-            print("   ✅ Excel actualizado: estado='Cita Programada'")
+            print(f"   ✅ Excel actualizado: estado='Cita Programada' en {total_actualizados} fila(s)")
         else:
-            print(f"   ⚠️ No se pudo ubicar el registro en Excel para actualizar estado. _excel_index={idx}, sede={sede}, fecha={fecha}, hora={hora}, nro={nro}")
+            print(
+                "   ⚠️ No se pudo ubicar el registro en Excel para actualizar estado. "
+                f"_excel_index={idx}, indices_rel={indices_rel}"
+            )
     except Exception as e:
         print(f"   ⚠️ No se pudo actualizar Excel con estado 'Cita Programada': {e}")
 
@@ -2203,6 +2264,14 @@ def llenar_login_sel():
 
                         except Exception as e:
                             total_error += 1
+                            motivo_detencion = clasificar_motivo_detencion(e)
+                            if motivo_detencion == "VENTANA_CERRADA":
+                                print(
+                                    f"🛑 Registro idx={idx_excel} no procesado: "
+                                    "la ventana/contexto del navegador fue cerrada."
+                                )
+                                raise KeyboardInterrupt("Ventana del navegador cerrada durante procesamiento") from e
+
                             print(f"❌ Error en registro idx={idx_excel}: {e}")
 
                             error_txt = str(e or "")
@@ -2245,7 +2314,15 @@ def llenar_login_sel():
                     break
 
                 except Exception as e:
-                    print(f"❌ Intento {intento_global+1} para grupo {grupo_ruc} falló: {e}")
+                    motivo_detencion = clasificar_motivo_detencion(e)
+                    if motivo_detencion == "VENTANA_CERRADA":
+                        print(
+                            "🛑 Proceso detenido: se cerró la ventana/contexto del navegador "
+                            f"durante el login del grupo {grupo_ruc}."
+                        )
+                        raise KeyboardInterrupt("Ventana del navegador cerrada") from e
+
+                    print(f"❌ Intento {intento_global} para grupo {grupo_ruc} falló: {e}")
                     if intento_global < 2:
                         print("   Reintentando...")
                         time.sleep(1)
@@ -2276,6 +2353,14 @@ def llenar_login_sel():
         else:
             print("\n❌ No se pudo completar el login después de todos los intentos.")
             input("   Presiona ENTER para cerrar el navegador...")
+
+    except KeyboardInterrupt as e:
+        if duracion_total_flujo is None:
+            duracion_total_flujo = time.time() - inicio_total_flujo
+        print("\n🛑 Ejecución interrumpida.")
+        print(f"   → Motivo: {e}")
+        print(f"   ⏱️ Tiempo transcurrido: {duracion_total_flujo:.2f} segundos")
+        print(f"   📊 Resumen parcial: OK={total_ok} | SIN_CUPO={total_sin_cupo} | ERROR={total_error}")
 
     finally:
         try:

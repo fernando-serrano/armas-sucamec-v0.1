@@ -1,213 +1,298 @@
 # ARMAS-SUCAMEC
 
-Automatización asistida del flujo de programación de citas en SEL (SUCAMEC), enfocada en el proceso **EXAMEN PARA POLIGONO DE TIRO**.
+Automatizacion asistida del flujo de programacion de citas en SEL (SUCAMEC), enfocada en:
 
-Este repositorio implementa un flujo operativo de extremo a extremo **hasta el paso previo a generar una cita real**.
+- EXAMEN PARA POLIGONO DE TIRO
 
-## 1. Proposito del proyecto
+El proceso esta implementado de extremo a extremo sobre el wizard de SEL, incluyendo generacion de cita con reintentos rapidos cuando aplica.
 
-Reducir trabajo manual repetitivo en la programacion de citas, manteniendo control humano donde el proceso lo requiere.
+## 1. Objetivo
 
-En su estado actual, el script:
+Reducir trabajo manual repetitivo en la programacion de citas, manteniendo trazabilidad operativa por Excel y logs claros para diagnostico.
 
-- toma datos desde Excel,
-- completa automaticamente los pasos del wizard en SEL,
-- valida selecciones criticas,
-- se detiene antes de cualquier accion final de emision/generacion definitiva de cita.
+## 2. Estado actual (real del codigo)
 
-## 2. Alcance funcional actual
+El script actual en pipeline-armas.py:
 
-El MVP ya cubre estas capacidades:
+- procesa registros Pendiente desde Excel,
+- ordena y agrupa por reglas operativas (RUC/grupo, prioridad, doc, solicitud, fecha_programacion),
+- ejecuta login por grupo de credenciales,
+- navega y completa Paso 1, Paso 2, Fase 2 y Fase 3,
+- ejecuta generar cita con reintentos rapidos,
+- actualiza Excel en estado/observaciones,
+- deja navegador abierto al final para uso manual,
+- registra interrupciones y cierre de ventana con mensajes especificos.
 
-- login en autenticacion tradicional (con OCR y fallback manual para captcha),
-- navegacion robusta a CITAS -> RESERVAS DE CITAS,
-- seleccion de tipo de cita EXAMEN PARA POLIGONO DE TIRO,
-- reserva de cupo por sede, fecha y hora con validacion de cupos,
-- completado del Paso 2 (tipo de operacion, documento vigilante, solicitud SI, nro solicitud),
-- completado de tabla de armas en Fase 2 usando `tipo_arma` + `arma` del Excel,
-- completado de Fase 3 (captcha resumen + aceptacion de terminos),
-- permanencia del navegador abierto para validacion operativa manual.
-
-## 3. Limite operativo intencional
-
-El flujo se ejecuta **hasta antes de generar una cita real**.
-
-Eso significa que:
-
-- no se ejecuta accion final de confirmacion/emision de cita,
-- no se automatiza el cierre transaccional final,
-- el operador conserva el control del ultimo tramo sensible.
-
-## 4. Arquitectura y stack
+## 3. Stack tecnico
 
 - Python 3
-- Playwright (API sync)
-- pandas + openpyxl (lectura Excel)
-- pytesseract + Pillow (OCR opcional)
-- dotenv (.env para configuracion)
+- Playwright sync_api
+- pandas + openpyxl
+- python-dotenv
+- Pillow + pytesseract (opcional OCR)
 
-Enfoque adoptado:
+## 4. Configuracion (.env)
 
-- Excel local como fuente de verdad para iterar rapido,
-- selectores PrimeFaces con validaciones post-accion,
-- estrategia de fallback para componentes JSF inestables,
-- automatizacion asistida en vez de full unattended.
+### 4.1 Variables de credenciales (grupo base)
 
-## 5. Estructura de datos (Excel)
+- TIPO_DOC (default: RUC)
+- NUMERO_DOCUMENTO
+- USUARIO_SEL
+- CLAVE_SEL
 
-Columnas requeridas por el flujo actual:
+### 4.2 Variables de credenciales (grupo SELVA)
 
-- `sede`
-- `fecha`
-- `hora_rango`
-- `tipo_operacion`
-- `doc_vigilante` (o `dni` como fallback)
-- `nro_solicitud`
-- `tipo_arma`
-- `arma`
-- `estado` (se procesa `Pendiente`)
+- SELVA_TIPO_DOC (default: RUC)
+- SELVA_NUMERO_DOCUMENTO
+- SELVA_USUARIO_SEL
+- SELVA_CLAVE_SEL
 
-Columnas opcionales/operativas:
+### 4.3 Variables operativas
 
-- `id_registro`
-- `observacion`
-- `fecha_programacion` (si existe, se usa para agrupar registros relacionados)
+- EXCEL_PATH (default: data/programaciones-armas.xlsx)
+- VALIDAR_FECHA_PROGRAMACION_HOY (default: 1)
 
-Regla de procesamiento actual:
+Notas:
 
-- se toma el primer registro `Pendiente`,
-- se agrupan registros del mismo documento y misma fecha de programacion,
-- de ese grupo se construyen los objetivos de arma para Fase 2.
+- si VALIDAR_FECHA_PROGRAMACION_HOY=1, solo procesa pendientes cuya fecha_programacion (o fecha) sea hoy,
+- si VALIDAR_FECHA_PROGRAMACION_HOY=0, permite reprocesos fuera de fecha.
 
-## 6. Flujo completo implementado
+## 5. Excel: columnas consideradas
 
-### 6.1 Inicio y carga de datos
+### 5.1 Requeridas para el flujo
 
-1. Carga variables de entorno.
+- sede
+- fecha
+- hora_rango
+- tipo_operacion
+- nro_solicitud
+- tipo_arma
+- arma
+- estado
+
+### 5.2 Requeridas por logica operativa (se crean vacias si faltan)
+
+- doc_vigilante (fallback: dni)
+- dni
+- ruc
+- prioridad
+
+### 5.3 Opcionales
+
+- id_registro
+- observacion / observaciones
+- fecha_programacion (si no existe, se usa fecha)
+
+## 6. Reglas de seleccion y agrupacion
+
+### 6.1 Filtro base
+
+Se toma estado que contenga PENDIENTE (case-insensitive).
+
+### 6.2 Filtro por fecha del dia
+
+Aplicado por defecto con VALIDAR_FECHA_PROGRAMACION_HOY=1.
+
+### 6.3 Orden operativo
+
+1. Grupo RUC: SELVA -> JV -> OTRO
+2. Prioridad: ALTA antes de NORMAL
+3. Orden original del Excel
+
+### 6.4 Deduplicacion de trabajos
+
+Se deduplica por:
+
+- doc_vigilante/dni normalizado
+- nro_solicitud
+- fecha_programacion (o fecha) normalizada
+- grupo RUC
+
+Cada trabajo representa una cita/programacion a procesar.
+
+### 6.5 Registros relacionados dentro de un trabajo
+
+Al cargar un trabajo, se detectan filas relacionadas con misma clave:
+
+- doc_vigilante/dni
+- nro_solicitud
+- fecha_programacion/fecha
+
+Se guardan en _excel_indices_relacionados para:
+
+- construir objetivos de armas en Fase 2,
+- propagar actualizaciones de estado/observaciones a todas las filas relacionadas.
+
+## 7. Flujo normal end-to-end
+
+## 7.1 Preparacion
+
+1. Carga .env.
 2. Lee Excel y valida columnas.
-3. Obtiene primer registro pendiente.
-4. Normaliza fecha (`dd/mm/yyyy`) y hora (`HH:MM-HH:MM`).
-5. Construye objetivos de arma para la tabla `dtTipoLic`.
+3. Obtiene trabajos pendientes segun filtros y orden operativo.
+4. Separa trabajos por grupo RUC (SELVA, JV, OTRO).
 
-### 6.2 Login SEL
+## 7.2 Login por grupo
 
-1. Abre navegador Chromium visible.
-2. Ingresa a login tradicional.
-3. Completa tipo doc, numero, usuario y clave.
-4. Resuelve captcha con OCR base (primera lectura valida por intento) o modo manual.
-5. Envia login y valida URL de acceso.
+1. Valida que existan credenciales del grupo.
+2. Abre Chromium visible.
+3. Va a login tradicional.
+4. Espera recuperacion si hay Service Unavailable (503).
+5. Completa credenciales.
+6. Resuelve captcha con OCR o modo manual.
+7. Envia login y valida por UI autenticada (no solo URL).
 
-### 6.3 Navegacion a Reservas
+## 7.3 Navegacion y configuracion inicial
 
-1. Intenta fast-path al item `RESERVAS DE CITAS`.
-2. Si no confirma, usa flujo estandar PanelMenu (expandir CITAS y click en submenu).
-3. Verifica que se haya cargado `gestionCitasForm`.
+1. Navega a CITAS -> RESERVAS DE CITAS (fast-path + fallback robusto).
+2. Selecciona EXAMEN PARA POLIGONO DE TIRO.
 
-### 6.4 Seleccion de tipo de cita
+## 7.4 Procesamiento por trabajo
 
-1. Abre SelectOneMenu `Cita para`.
-2. Selecciona `EXAMEN PARA POLIGONO DE TIRO`.
-3. Valida etiqueta final del combo.
+1. Carga registro objetivo desde Excel.
+2. Recalcula y adjunta filas relacionadas (_excel_indices_relacionados).
+3. Paso 1: seleccion sede/fecha, busca hora y valida cupos.
+4. Paso 2: seleccion tipo_operacion, doc_vigilante, SI, nro_solicitud.
+5. Fase 2: completa dtTipoLic con pares (tipo, arma) inferidos.
+6. Fase 3: captcha + terminos.
+7. Genera cita con reintentos rapidos ante fallo captcha/validacion.
+8. Marca Excel como Cita Programada (todas las filas relacionadas).
+9. Limpia wizard para siguiente trabajo.
 
-### 6.5 Reserva de cupos (Paso 1)
+## 7.5 Cierre
 
-1. Selecciona `sede` y `fecha` desde Excel.
-2. Busca `hora_rango` en tabla de programacion.
-3. Verifica cupos libres > 0.
-4. Marca radiobutton de la fila.
-5. Avanza con boton `Siguiente`.
+- imprime resumen final OK/SIN_CUPO/ERROR,
+- mantiene navegador abierto para uso manual,
+- cierra limpio con Ctrl+C o al finalizar.
 
-### 6.6 Datos de solicitud (Paso 2)
+## 8. Validaciones clave implementadas
 
-1. Selecciona `tipo_operacion` por coincidencia flexible.
-2. Resuelve autocomplete de `doc_vigilante` con fallback.
-3. Fuerza `Seleccione Solicitud = SI`.
-4. Selecciona `nro_solicitud` por token numerico del Excel.
+- validacion de login por presencia de UI autenticada,
+- deteccion de mensajes de error en login,
+- deteccion de Service Unavailable y espera activa,
+- confirmacion de selectores PrimeFaces despues de cada seleccion,
+- validacion de hora objetivo y cupos libres,
+- verificacion de radiobutton seleccionado,
+- verificacion de etiquetas finales en combos,
+- validacion de seleccion efectiva en tabla dtTipoLic,
+- validacion de checkbox de terminos,
+- fallbacks para componentes JSF/PrimeFaces inestables.
 
-### 6.7 Tabla de armas (Fase 2)
+## 9. Logs operativos y eventos
 
-1. Localiza filas de `dtTipoLic`.
-2. Activa celda editable de arma.
-3. Selecciona arma segun pares `(tipo_fila, arma_objetivo)` derivados del Excel.
-4. Valida seleccion efectiva en cada fila.
-5. Avanza con `botonSiguiente3`.
+El flujo reporta eventos de negocio y diagnostico, por ejemplo:
 
-### 6.8 Resumen y terminos (Fase 3)
+- inicio de script,
+- cantidad de pendientes detectados,
+- filtro por fecha y registros filtrados,
+- grupo RUC en proceso,
+- intento de login actual,
+- exito/falla de login con tiempo,
+- avance por registro y por fase,
+- sin cupo,
+- errores por registro,
+- actualizacion de Excel con cantidad de filas afectadas,
+- resumen final o parcial.
 
-1. Espera panel de resumen.
-2. Resuelve captcha del resumen con la logica base del login.
-3. Configuracion actual para Fase 3:
-   - sin refresh automatico,
-   - sin filtro de ambiguedad,
-   - sin limite de intentos OCR (`max_intentos=None`).
-4. Escribe captcha o deriva a ingreso manual si OCR no aplica.
-5. Marca checkbox de terminos y valida estado activo.
+Eventos de detencion explicitos:
 
-### 6.9 Punto de corte del MVP
+- interrupcion manual (KeyboardInterrupt),
+- ventana/contexto de navegador cerrada,
+- fin de ejecucion con navegador cerrado.
 
-Al terminar Fase 3, el flujo imprime tiempos y deja el navegador abierto para accion manual.
+## 10. Excepciones y manejo
 
-No ejecuta la accion final de generar/emitir cita.
+### 10.1 SinCupoError
 
-## 7. Funciones clave del script
+Se lanza cuando la hora existe pero no hay cupos disponibles. Resultado:
 
-Las funciones principales se encuentran en `prueba-8.py`:
+- incrementa contador SIN_CUPO,
+- escribe observacion en Excel,
+- continua con el siguiente trabajo.
 
-- `llenar_login_sel`: orquestador principal del flujo.
-- `cargar_primer_registro_pendiente_desde_excel`: carga y prepara datos del Excel.
-- `navegar_reservas_citas`: navegacion robusta al modulo de reservas.
-- `seleccionar_tipo_cita_poligono`: seleccion de tipo de cita.
-- `seleccionar_sede_y_fecha_desde_registro`: completado del Paso 1.
-- `seleccionar_hora_con_cupo_y_avanzar`: seleccion de hora con control de cupos.
-- `completar_paso_2_desde_registro`: completado de datos de solicitud.
-- `completar_tabla_tipos_arma_y_avanzar`: mapeo de armas en Fase 2.
-- `completar_fase_3_resumen`: captcha de resumen y terminos.
-- `solve_captcha_ocr_base` y `solve_captcha_ocr`: motor OCR base estilo login.
+### 10.2 Errores de procesamiento por registro
 
-## 8. Configuracion requerida (.env)
+Se registran en observaciones con mensajes especificos:
 
-Variables de entorno usadas:
+- horario no figura en tabla,
+- documento vigilante no disponible para razon social/RUC,
+- error generico de procesamiento.
 
-- `TIPO_DOC` (default: `RUC`)
-- `NUMERO_DOCUMENTO`
-- `USUARIO_SEL`
-- `CLAVE_SEL`
-- `EXCEL_PATH` (default: `data/programaciones-armas.xlsx`)
+Luego intenta limpiar wizard y continuar.
 
-## 9. Dependencias
+### 10.3 Cierre de ventana/contexto
 
-Dependencias base:
+Se clasifica como VENTANA_CERRADA y se eleva como interrupcion controlada para detener ejecucion con log explicito.
 
-- `playwright`
-- `python-dotenv`
-- `pandas`
-- `openpyxl`
+### 10.4 Interrupcion manual
+
+Se captura KeyboardInterrupt a nivel principal y se imprime resumen parcial:
+
+- tiempo transcurrido,
+- acumulados OK/SIN_CUPO/ERROR.
+
+## 11. Escritura en Excel
+
+## 11.1 registrar_sin_cupo_en_excel
+
+- escribe en observaciones/observacion,
+- actualiza todas las filas relacionadas,
+- fallback por coincidencia de sede+fecha+hora_rango+nro_solicitud.
+
+## 11.2 registrar_cita_programada_en_excel
+
+- escribe estado=Cita Programada,
+- actualiza todas las filas relacionadas,
+- mismo fallback por coincidencia si no hay indices directos.
+
+## 12. Dependencias
+
+Instalar base:
+
+- playwright
+- python-dotenv
+- pandas
+- openpyxl
 
 OCR opcional:
 
-- `pytesseract`
-- `Pillow`
+- pytesseract
+- Pillow
 - instalacion local de Tesseract OCR
 
-## 10. Ejecucion
-
-Desde la carpeta del proyecto:
+Luego ejecutar instalacion de navegadores de Playwright:
 
 ```bash
-python prueba-8.py
+playwright install
 ```
 
-## 11. Manejo de errores y robustez
+## 13. Ejecucion
 
-El script incorpora:
+Desde la raiz del proyecto:
 
-- reintentos globales de login,
-- validaciones de estado tras cada seleccion critica,
-- fallbacks para componentes PrimeFaces (paneles, autocomplete, celdas editables),
-- mensajes de log orientados a diagnostico operativo.
+```bash
+python pipeline-armas.py
+```
 
-## 12. Estado del proyecto
+## 14. Funciones principales del script
 
-Estado actual: **MVP funcional avanzado**.
+- llenar_login_sel
+- obtener_trabajos_pendientes_excel
+- cargar_primer_registro_pendiente_desde_excel
+- navegar_reservas_citas
+- seleccionar_tipo_cita_poligono
+- seleccionar_sede_y_fecha_desde_registro
+- seleccionar_hora_con_cupo_y_avanzar
+- completar_paso_2_desde_registro
+- completar_tabla_tipos_arma_y_avanzar
+- completar_fase_3_resumen
+- generar_cita_final_con_reintento_rapido
+- registrar_sin_cupo_en_excel
+- registrar_cita_programada_en_excel
 
-Listo para operar flujo asistido hasta el resumen final, con control humano antes de generar una cita real.
+## 15. Consideraciones operativas
+
+- El navegador se ejecuta en modo visible (headless=False).
+- El captcha puede requerir intervencion manual.
+- El flujo puede detenerse por cierre de ventana o interrupcion del operador, dejando trazas claras en log.
+- El script esta orientado a operacion asistida, con foco en robustez y trazabilidad.
